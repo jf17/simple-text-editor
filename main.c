@@ -562,6 +562,77 @@ void on_menu_duplicate_line_activate(GtkMenuItem *menuitem, gpointer user_data) 
     duplicate_line();
 }
 
+static gchar *ensure_trailing_newline(gchar *text) {
+    if (!text || text[0] == '\0' || g_str_has_suffix(text, "\n"))
+        return text;
+    {
+        gchar *with_nl = g_strconcat(text, "\n", NULL);
+        g_free(text);
+        return with_nl;
+    }
+}
+
+static void move_line(gint direction) {
+    GtkTextIter cur_start, cur_end, oth_start, oth_end, block_start, block_end, cursor;
+    GtkTextMark *mark;
+    gchar *cur_text;
+    gchar *oth_text;
+    gchar *combined;
+    gint line_no, line_offset, target, line_count;
+
+    clear_multicursor();
+
+    mark = gtk_text_buffer_get_insert(app.buffer);
+    gtk_text_buffer_get_iter_at_mark(app.buffer, &cursor, mark);
+    line_no = gtk_text_iter_get_line(&cursor);
+    line_offset = gtk_text_iter_get_line_offset(&cursor);
+    line_count = gtk_text_buffer_get_line_count(app.buffer);
+    target = line_no + direction;
+
+    if (target < 0 || target >= line_count)
+        return;
+
+    gtk_text_buffer_get_iter_at_line(app.buffer, &cur_start, line_no);
+    cur_end = cur_start;
+    gtk_text_iter_forward_line(&cur_end);
+
+    gtk_text_buffer_get_iter_at_line(app.buffer, &oth_start, target);
+    oth_end = oth_start;
+    gtk_text_iter_forward_line(&oth_end);
+
+    cur_text = gtk_text_buffer_get_text(app.buffer, &cur_start, &cur_end, FALSE);
+    oth_text = gtk_text_buffer_get_text(app.buffer, &oth_start, &oth_end, FALSE);
+    if (!cur_text || !oth_text) {
+        g_free(cur_text);
+        g_free(oth_text);
+        return;
+    }
+
+    if (direction > 0) {
+        block_start = cur_start;
+        block_end = oth_end;
+        oth_text = ensure_trailing_newline(oth_text);
+        combined = g_strconcat(oth_text, cur_text, NULL);
+    } else {
+        block_start = oth_start;
+        block_end = cur_end;
+        cur_text = ensure_trailing_newline(cur_text);
+        combined = g_strconcat(cur_text, oth_text, NULL);
+    }
+
+    gtk_text_buffer_delete(app.buffer, &block_start, &block_end);
+    gtk_text_buffer_insert(app.buffer, &block_start, combined, -1);
+
+    g_free(cur_text);
+    g_free(oth_text);
+    g_free(combined);
+
+    gtk_text_buffer_get_iter_at_line_offset(app.buffer, &cursor, target, line_offset);
+    gtk_text_buffer_place_cursor(app.buffer, &cursor);
+    gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(app.text_view), mark);
+    update_status(direction > 0 ? "Строка перемещена вниз" : "Строка перемещена вверх");
+}
+
 static gint cursor_lo(const MultiCursor *c) {
     return MIN(c->insert, c->bound);
 }
@@ -1020,6 +1091,17 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer use
     /* Modifier-only presses must not reset multi-cursor (e.g. holding Shift) */
     if (is_modifier_key(event->keyval))
         return FALSE;
+
+    if (mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) {
+        if (event->keyval == GDK_KEY_Down || event->keyval == GDK_KEY_KP_Down) {
+            move_line(1);
+            return TRUE;
+        }
+        if (event->keyval == GDK_KEY_Up || event->keyval == GDK_KEY_KP_Up) {
+            move_line(-1);
+            return TRUE;
+        }
+    }
 
     if (mods == GDK_MOD1_MASK) {
         if (event->keyval == GDK_KEY_Down || event->keyval == GDK_KEY_KP_Down) {
