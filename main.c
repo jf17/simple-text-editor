@@ -9,6 +9,10 @@
 #define ICON_PATH "/usr/share/pixmaps/simple-text-editor.png"
 #endif
 
+#ifndef APP_VERSION
+#define APP_VERSION "0.0.0"
+#endif
+
 #define APP_NAME "Simple Text Editor"
 #define MAX_UNDO 200
 
@@ -504,7 +508,7 @@ void on_menu_about_activate(GtkMenuItem *menuitem, gpointer user_data) {
 
     gtk_show_about_dialog(GTK_WINDOW(app.window),
                           "program-name", APP_NAME,
-                          "version", "1.0.0",
+                          "version", APP_VERSION,
                           "comments", "Простой текстовый редактор на GTK3 и Glade",
                           "authors", authors,
                           "logo", app.icon,

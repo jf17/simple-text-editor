@@ -33,8 +33,8 @@ GTK3 and Glade
 При теге `v*` пакет также прикрепляется к GitHub Release:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 ## Dependencies
@@ -82,7 +82,7 @@ make deb
 Установка:
 
 ```bash
-sudo apt install ./simple-text-editor_1.0.0_amd64.deb
+sudo apt install ./simple-text-editor_1.1.0_amd64.deb
 ```
 
 ## Clean

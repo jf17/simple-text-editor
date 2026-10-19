@@ -16,22 +16,26 @@ PIXMAPDIR   := $(PREFIX)/share/pixmaps
 APPDIR      := $(PREFIX)/share/applications
 ICONDIR     := $(PREFIX)/share/icons/hicolor/512x512/apps
 
-# deb package
+# Version from latest git tag (v1.2.3 -> 1.2.3), fallback for shallow/no-git builds
+GIT_VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
 PKG_NAME    := simple-text-editor
-PKG_VERSION := 1.0.0
+PKG_VERSION ?= $(if $(GIT_VERSION),$(GIT_VERSION),0.0.0)
 PKG_ARCH    := $(shell dpkg-architecture -qDEB_HOST_ARCH 2>/dev/null || echo amd64)
 DEB_DIR     := build/deb
 DEB_ROOT    := $(DEB_DIR)/$(PKG_NAME)_$(PKG_VERSION)_$(PKG_ARCH)
 DEB_FILE    := $(PKG_NAME)_$(PKG_VERSION)_$(PKG_ARCH).deb
 
+CFLAGS += -DAPP_VERSION=\"$(PKG_VERSION)\"
+
 .PHONY: help deps all clean run install deb
 
 help:
+	@echo "Version: $(PKG_VERSION)"
 	@echo "Usage:"
 	@echo "  make deps   - check build dependencies"
 	@echo "  make all    - build $(TARGET)"
 	@echo "  make run    - build and run"
-	@echo "  make deb    - build .deb package"
+	@echo "  make deb    - build .deb package ($(DEB_FILE))"
 	@echo "  make clean  - remove binary and package artifacts"
 	@echo "  make help   - show this help"
 
@@ -109,5 +113,5 @@ deb: deps $(TARGET)
 	@echo "Built: $(DEB_FILE)"
 
 clean:
-	rm -f $(TARGET) $(DEB_FILE)
+	rm -f $(TARGET) $(PKG_NAME)_*_*.deb
 	rm -rf build
