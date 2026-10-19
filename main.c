@@ -37,11 +37,22 @@ typedef struct {
     gchar *current_file;
     gboolean modified;
     gboolean applying_undo;
+    gboolean multicursor_edit;
     GList *undo_stack;
     GList *redo_stack;
+    GArray *cursors;              /* MultiCursor entries */
+    gint preferred_column;        /* insert column for Alt+Up/Down */
+    gint preferred_bound_column;  /* selection-bound column for column select */
 } App;
 
+typedef struct {
+    gint insert;
+    gint bound;
+} MultiCursor;
+
 static App app;
+
+static void clear_multicursor(void);
 
 static gchar *exe_dir(void) {
     gchar *exe = g_file_read_link("/proc/self/exe", NULL);
@@ -291,6 +302,7 @@ static void load_file(const gchar *filename) {
     app.applying_undo = TRUE;
     clear_undo_stack(&app.undo_stack);
     clear_undo_stack(&app.redo_stack);
+    clear_multicursor();
     gtk_text_buffer_set_text(app.buffer, content, (gssize)length);
     app.applying_undo = FALSE;
 
@@ -308,6 +320,7 @@ static void new_document(void) {
     app.applying_undo = TRUE;
     clear_undo_stack(&app.undo_stack);
     clear_undo_stack(&app.redo_stack);
+    clear_multicursor();
     gtk_text_buffer_set_text(app.buffer, "", 0);
     app.applying_undo = FALSE;
 
@@ -500,6 +513,579 @@ void on_menu_select_all_activate(GtkMenuItem *menuitem, gpointer user_data) {
     gtk_text_buffer_select_range(app.buffer, &start, &end);
 }
 
+static void duplicate_line(void) {
+    GtkTextIter start, end, insert_at, cursor;
+    gchar *text;
+    gint line_offset = 0;
+    gint line_no = 0;
+    gboolean has_selection;
+
+    has_selection = gtk_text_buffer_get_selection_bounds(app.buffer, &start, &end);
+    if (!has_selection) {
+        GtkTextMark *mark = gtk_text_buffer_get_insert(app.buffer);
+        gtk_text_buffer_get_iter_at_mark(app.buffer, &start, mark);
+        line_offset = gtk_text_iter_get_line_offset(&start);
+        line_no = gtk_text_iter_get_line(&start);
+        gtk_text_iter_set_line_offset(&start, 0);
+        end = start;
+        gtk_text_iter_forward_line(&end);
+    }
+
+    text = gtk_text_buffer_get_text(app.buffer, &start, &end, FALSE);
+    if (!text)
+        return;
+
+    insert_at = end;
+    if (!has_selection && text[0] != '\0' && !g_str_has_suffix(text, "\n")) {
+        gchar *with_nl = g_strconcat("\n", text, NULL);
+        g_free(text);
+        text = with_nl;
+    } else if (!has_selection && text[0] == '\0') {
+        g_free(text);
+        text = g_strdup("\n");
+    }
+
+    gtk_text_buffer_insert(app.buffer, &insert_at, text, -1);
+
+    if (!has_selection) {
+        gtk_text_buffer_get_iter_at_line_offset(app.buffer, &cursor, line_no + 1, line_offset);
+        gtk_text_buffer_place_cursor(app.buffer, &cursor);
+    }
+
+    g_free(text);
+    update_status("Строка скопирована");
+}
+
+void on_menu_duplicate_line_activate(GtkMenuItem *menuitem, gpointer user_data) {
+    (void)menuitem;
+    (void)user_data;
+    duplicate_line();
+}
+
+static gint cursor_lo(const MultiCursor *c) {
+    return MIN(c->insert, c->bound);
+}
+
+static gint cursor_hi(const MultiCursor *c) {
+    return MAX(c->insert, c->bound);
+}
+
+static gboolean cursor_has_selection(const MultiCursor *c) {
+    return c->insert != c->bound;
+}
+
+static gint cmp_cursor(gconstpointer a, gconstpointer b) {
+    const MultiCursor *ca = a;
+    const MultiCursor *cb = b;
+    gint d = cursor_lo(ca) - cursor_lo(cb);
+    if (d != 0)
+        return d;
+    return cursor_hi(ca) - cursor_hi(cb);
+}
+
+static gint get_primary_offset(void) {
+    GtkTextIter iter;
+    gtk_text_buffer_get_iter_at_mark(app.buffer, &iter, gtk_text_buffer_get_insert(app.buffer));
+    return gtk_text_iter_get_offset(&iter);
+}
+
+static void sync_primary_cursor(const MultiCursor *c) {
+    GtkTextIter ins, bound;
+    gtk_text_buffer_get_iter_at_offset(app.buffer, &ins, c->insert);
+    gtk_text_buffer_get_iter_at_offset(app.buffer, &bound, c->bound);
+    gtk_text_buffer_select_range(app.buffer, &ins, &bound);
+}
+
+static void clear_multicursor(void) {
+    if (app.cursors)
+        g_array_set_size(app.cursors, 0);
+    app.preferred_column = -1;
+    app.preferred_bound_column = -1;
+    if (app.text_view)
+        gtk_widget_queue_draw(app.text_view);
+}
+
+static gboolean multicursor_active(void) {
+    return app.cursors && app.cursors->len > 1;
+}
+
+static void update_multicursor_status(void) {
+    if (multicursor_active()) {
+        guint selected = 0;
+        guint i;
+        gchar *msg;
+        for (i = 0; i < app.cursors->len; i++) {
+            if (cursor_has_selection(&g_array_index(app.cursors, MultiCursor, i)))
+                selected++;
+        }
+        if (selected > 0)
+            msg = g_strdup_printf("Мультикурсор: %u (выделение: %u)", app.cursors->len, selected);
+        else
+            msg = g_strdup_printf("Мультикурсор: %u", app.cursors->len);
+        update_status(msg);
+        g_free(msg);
+    }
+}
+
+static gint clamp_line_offset(gint line, gint column) {
+    GtkTextIter iter, end;
+    gint max_col;
+
+    gtk_text_buffer_get_iter_at_line(app.buffer, &iter, line);
+    end = iter;
+    if (!gtk_text_iter_ends_line(&end))
+        gtk_text_iter_forward_to_line_end(&end);
+    max_col = gtk_text_iter_get_line_offset(&end);
+    if (column < 0)
+        column = 0;
+    if (column > max_col)
+        column = max_col;
+    return column;
+}
+
+static MultiCursor cursor_on_line(gint line, gint insert_col, gint bound_col) {
+    MultiCursor c;
+    GtkTextIter iter;
+
+    insert_col = clamp_line_offset(line, insert_col);
+    bound_col = clamp_line_offset(line, bound_col);
+    gtk_text_buffer_get_iter_at_line_offset(app.buffer, &iter, line, insert_col);
+    c.insert = gtk_text_iter_get_offset(&iter);
+    gtk_text_buffer_get_iter_at_line_offset(app.buffer, &iter, line, bound_col);
+    c.bound = gtk_text_iter_get_offset(&iter);
+    return c;
+}
+
+static void seed_cursors_from_primary(void) {
+    MultiCursor c;
+    GtkTextIter ins, bound;
+
+    if (!app.cursors)
+        app.cursors = g_array_new(FALSE, FALSE, sizeof(MultiCursor));
+    if (app.cursors->len > 0)
+        return;
+
+    gtk_text_buffer_get_iter_at_mark(app.buffer, &ins, gtk_text_buffer_get_insert(app.buffer));
+    gtk_text_buffer_get_iter_at_mark(app.buffer, &bound, gtk_text_buffer_get_selection_bound(app.buffer));
+    c.insert = gtk_text_iter_get_offset(&ins);
+    c.bound = gtk_text_iter_get_offset(&bound);
+    g_array_append_val(app.cursors, c);
+
+    app.preferred_column = gtk_text_iter_get_line_offset(&ins);
+    app.preferred_bound_column = gtk_text_iter_get_line_offset(&bound);
+}
+
+static void add_cursor_vertical(gint direction) {
+    MultiCursor neu;
+    gint extreme_line, new_line, line_count;
+    guint i;
+    gboolean exists = FALSE;
+
+    seed_cursors_from_primary();
+
+    extreme_line = 0;
+    for (i = 0; i < app.cursors->len; i++) {
+        GtkTextIter it;
+        MultiCursor *c = &g_array_index(app.cursors, MultiCursor, i);
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &it, c->insert);
+        if (i == 0)
+            extreme_line = gtk_text_iter_get_line(&it);
+        else if (direction > 0)
+            extreme_line = MAX(extreme_line, gtk_text_iter_get_line(&it));
+        else
+            extreme_line = MIN(extreme_line, gtk_text_iter_get_line(&it));
+    }
+
+    new_line = extreme_line + direction;
+    line_count = gtk_text_buffer_get_line_count(app.buffer);
+    if (new_line < 0 || new_line >= line_count)
+        return;
+
+    if (app.preferred_column < 0)
+        app.preferred_column = 0;
+    if (app.preferred_bound_column < 0)
+        app.preferred_bound_column = app.preferred_column;
+
+    neu = cursor_on_line(new_line, app.preferred_column, app.preferred_bound_column);
+
+    for (i = 0; i < app.cursors->len; i++) {
+        MultiCursor *c = &g_array_index(app.cursors, MultiCursor, i);
+        if (c->insert == neu.insert && c->bound == neu.bound) {
+            exists = TRUE;
+            break;
+        }
+    }
+    if (!exists)
+        g_array_append_val(app.cursors, neu);
+
+    g_array_sort(app.cursors, cmp_cursor);
+    sync_primary_cursor(&neu);
+    gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(app.text_view),
+                                       gtk_text_buffer_get_insert(app.buffer));
+    gtk_widget_queue_draw(app.text_view);
+    update_multicursor_status();
+}
+
+static void extend_multicursor_selection(gint direction) {
+    guint i;
+    gint primary = get_primary_offset();
+    MultiCursor *primary_cursor = NULL;
+
+    if (!multicursor_active())
+        return;
+
+    for (i = 0; i < app.cursors->len; i++) {
+        MultiCursor *c = &g_array_index(app.cursors, MultiCursor, i);
+        GtkTextIter iter;
+        gint line, col;
+
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &iter, c->insert);
+        line = gtk_text_iter_get_line(&iter);
+        col = gtk_text_iter_get_line_offset(&iter) + direction;
+        col = clamp_line_offset(line, col);
+        gtk_text_buffer_get_iter_at_line_offset(app.buffer, &iter, line, col);
+        c->insert = gtk_text_iter_get_offset(&iter);
+
+        if (c->insert == primary || c->bound == primary ||
+            (cursor_lo(c) <= primary && cursor_hi(c) >= primary))
+            primary_cursor = c;
+    }
+
+    /* Keep preferred columns in sync with primary insert/bound */
+    if (primary_cursor) {
+        GtkTextIter ins, bound;
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &ins, primary_cursor->insert);
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &bound, primary_cursor->bound);
+        app.preferred_column = gtk_text_iter_get_line_offset(&ins);
+        app.preferred_bound_column = gtk_text_iter_get_line_offset(&bound);
+        sync_primary_cursor(primary_cursor);
+    } else {
+        sync_primary_cursor(&g_array_index(app.cursors, MultiCursor, app.cursors->len - 1));
+    }
+
+    gtk_widget_queue_draw(app.text_view);
+    update_multicursor_status();
+}
+
+static gint find_primary_index(void) {
+    gint primary = get_primary_offset();
+    guint i;
+    for (i = 0; i < app.cursors->len; i++) {
+        MultiCursor *c = &g_array_index(app.cursors, MultiCursor, i);
+        if (c->insert == primary)
+            return (gint)i;
+    }
+    return app.cursors->len ? (gint)app.cursors->len - 1 : -1;
+}
+
+static void multicursor_insert(const gchar *text) {
+    GArray *new_cursors;
+    gint char_len, shift = 0, primary_idx, new_primary = -1;
+    guint i;
+
+    if (!multicursor_active())
+        return;
+
+    char_len = g_utf8_strlen(text, -1);
+    primary_idx = find_primary_index();
+    g_array_sort(app.cursors, cmp_cursor);
+    /* Re-find primary after sort */
+    primary_idx = find_primary_index();
+    new_cursors = g_array_sized_new(FALSE, FALSE, sizeof(MultiCursor), app.cursors->len);
+    app.multicursor_edit = TRUE;
+
+    for (i = 0; i < app.cursors->len; i++) {
+        MultiCursor old = g_array_index(app.cursors, MultiCursor, i);
+        MultiCursor neu;
+        GtkTextIter start, end;
+        gint lo = cursor_lo(&old) + shift;
+        gint hi = cursor_hi(&old) + shift;
+        gint deleted;
+
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &start, lo);
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &end, hi);
+        deleted = hi - lo;
+        if (deleted > 0)
+            gtk_text_buffer_delete(app.buffer, &start, &end);
+
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &start, lo);
+        gtk_text_buffer_insert(app.buffer, &start, text, -1);
+        neu.insert = gtk_text_iter_get_offset(&start);
+        neu.bound = neu.insert;
+        g_array_append_val(new_cursors, neu);
+
+        if ((gint)i == primary_idx)
+            new_primary = neu.insert;
+
+        shift += char_len - deleted;
+    }
+
+    app.multicursor_edit = FALSE;
+    g_array_free(app.cursors, TRUE);
+    app.cursors = new_cursors;
+    app.preferred_bound_column = app.preferred_column;
+    if (new_primary >= 0) {
+        MultiCursor c = { new_primary, new_primary };
+        sync_primary_cursor(&c);
+    }
+    gtk_widget_queue_draw(app.text_view);
+    update_multicursor_status();
+}
+
+static void multicursor_delete_selections_or(gboolean backspace) {
+    GArray *new_cursors;
+    gint shift = 0, primary_idx, new_primary = -1;
+    guint i;
+    gboolean any_selection = FALSE;
+
+    if (!multicursor_active())
+        return;
+
+    for (i = 0; i < app.cursors->len; i++) {
+        if (cursor_has_selection(&g_array_index(app.cursors, MultiCursor, i))) {
+            any_selection = TRUE;
+            break;
+        }
+    }
+
+    primary_idx = find_primary_index();
+    g_array_sort(app.cursors, cmp_cursor);
+    primary_idx = find_primary_index();
+    new_cursors = g_array_sized_new(FALSE, FALSE, sizeof(MultiCursor), app.cursors->len);
+    app.multicursor_edit = TRUE;
+
+    for (i = 0; i < app.cursors->len; i++) {
+        MultiCursor old = g_array_index(app.cursors, MultiCursor, i);
+        MultiCursor neu;
+        GtkTextIter start, end;
+        gint lo = cursor_lo(&old) + shift;
+        gint hi = cursor_hi(&old) + shift;
+        gint deleted = 0;
+
+        if (any_selection) {
+            if (hi > lo) {
+                gtk_text_buffer_get_iter_at_offset(app.buffer, &start, lo);
+                gtk_text_buffer_get_iter_at_offset(app.buffer, &end, hi);
+                deleted = hi - lo;
+                gtk_text_buffer_delete(app.buffer, &start, &end);
+            }
+            neu.insert = lo;
+            neu.bound = lo;
+        } else if (backspace) {
+            gtk_text_buffer_get_iter_at_offset(app.buffer, &end, lo);
+            start = end;
+            if (gtk_text_iter_backward_char(&start)) {
+                deleted = 1;
+                gtk_text_buffer_delete(app.buffer, &start, &end);
+                lo = gtk_text_iter_get_offset(&start);
+            }
+            neu.insert = lo;
+            neu.bound = lo;
+        } else {
+            gtk_text_buffer_get_iter_at_offset(app.buffer, &start, lo);
+            end = start;
+            if (gtk_text_iter_forward_char(&end)) {
+                deleted = 1;
+                gtk_text_buffer_delete(app.buffer, &start, &end);
+            }
+            neu.insert = lo;
+            neu.bound = lo;
+        }
+
+        g_array_append_val(new_cursors, neu);
+        if ((gint)i == primary_idx)
+            new_primary = neu.insert;
+        shift -= deleted;
+    }
+
+    app.multicursor_edit = FALSE;
+    g_array_free(app.cursors, TRUE);
+    app.cursors = new_cursors;
+    app.preferred_bound_column = app.preferred_column;
+    if (new_primary >= 0) {
+        MultiCursor c = { new_primary, new_primary };
+        sync_primary_cursor(&c);
+    }
+    gtk_widget_queue_draw(app.text_view);
+    update_multicursor_status();
+}
+
+static gboolean on_draw_cursors(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
+    GtkStyleContext *style;
+    GdkRGBA fg, sel;
+    gint primary;
+    guint i;
+
+    (void)user_data;
+
+    if (!multicursor_active())
+        return FALSE;
+
+    style = gtk_widget_get_style_context(widget);
+    gtk_style_context_get_color(style, gtk_style_context_get_state(style), &fg);
+    if (!gtk_style_context_lookup_color(style, "theme_selected_bg_color", &sel)) {
+        sel = fg;
+        sel.alpha = 0.35;
+    } else {
+        sel.alpha = 0.45;
+    }
+    primary = get_primary_offset();
+
+    for (i = 0; i < app.cursors->len; i++) {
+        MultiCursor *c = &g_array_index(app.cursors, MultiCursor, i);
+        GtkTextIter ins, lo, hi;
+        GdkRectangle loc, loc2;
+        gint x, y, x2;
+
+        gtk_text_buffer_get_iter_at_offset(app.buffer, &ins, c->insert);
+
+        if (cursor_has_selection(c)) {
+            gtk_text_buffer_get_iter_at_offset(app.buffer, &lo, cursor_lo(c));
+            gtk_text_buffer_get_iter_at_offset(app.buffer, &hi, cursor_hi(c));
+            gtk_text_view_get_iter_location(GTK_TEXT_VIEW(widget), &lo, &loc);
+            gtk_text_view_get_iter_location(GTK_TEXT_VIEW(widget), &hi, &loc2);
+            gtk_text_view_buffer_to_window_coords(GTK_TEXT_VIEW(widget),
+                                                  GTK_TEXT_WINDOW_TEXT,
+                                                  loc.x, loc.y, &x, &y);
+            gtk_text_view_buffer_to_window_coords(GTK_TEXT_VIEW(widget),
+                                                  GTK_TEXT_WINDOW_TEXT,
+                                                  loc2.x, loc2.y, &x2, NULL);
+            if (x2 < x) {
+                gint tmp = x;
+                x = x2;
+                x2 = tmp;
+            }
+            cairo_set_source_rgba(cr, sel.red, sel.green, sel.blue, sel.alpha);
+            cairo_rectangle(cr, x, y, MAX(x2 - x, 2), loc.height);
+            cairo_fill(cr);
+        }
+
+        if (c->insert != primary) {
+            gtk_text_view_get_iter_location(GTK_TEXT_VIEW(widget), &ins, &loc);
+            gtk_text_view_buffer_to_window_coords(GTK_TEXT_VIEW(widget),
+                                                  GTK_TEXT_WINDOW_TEXT,
+                                                  loc.x, loc.y, &x, &y);
+            cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.85);
+            cairo_rectangle(cr, x, y, 2, loc.height);
+            cairo_fill(cr);
+        }
+    }
+
+    return FALSE;
+}
+
+static gboolean on_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
+    (void)widget;
+    (void)event;
+    (void)user_data;
+    if (multicursor_active())
+        clear_multicursor();
+    return FALSE;
+}
+
+static gboolean is_modifier_key(guint keyval) {
+    switch (keyval) {
+    case GDK_KEY_Shift_L:
+    case GDK_KEY_Shift_R:
+    case GDK_KEY_Control_L:
+    case GDK_KEY_Control_R:
+    case GDK_KEY_Alt_L:
+    case GDK_KEY_Alt_R:
+    case GDK_KEY_Meta_L:
+    case GDK_KEY_Meta_R:
+    case GDK_KEY_Super_L:
+    case GDK_KEY_Super_R:
+    case GDK_KEY_Hyper_L:
+    case GDK_KEY_Hyper_R:
+    case GDK_KEY_ISO_Level3_Shift:
+    case GDK_KEY_Mode_switch:
+    case GDK_KEY_Num_Lock:
+    case GDK_KEY_Caps_Lock:
+    case GDK_KEY_Scroll_Lock:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
+    GdkModifierType mods;
+    guint32 ch;
+
+    (void)widget;
+    (void)user_data;
+
+    mods = event->state & gtk_accelerator_get_default_mod_mask();
+
+    /* Modifier-only presses must not reset multi-cursor (e.g. holding Shift) */
+    if (is_modifier_key(event->keyval))
+        return FALSE;
+
+    if (mods == GDK_MOD1_MASK) {
+        if (event->keyval == GDK_KEY_Down || event->keyval == GDK_KEY_KP_Down) {
+            add_cursor_vertical(1);
+            return TRUE;
+        }
+        if (event->keyval == GDK_KEY_Up || event->keyval == GDK_KEY_KP_Up) {
+            add_cursor_vertical(-1);
+            return TRUE;
+        }
+    }
+
+    if (event->keyval == GDK_KEY_Escape && multicursor_active()) {
+        clear_multicursor();
+        update_status("Мультикурсор сброшен");
+        return TRUE;
+    }
+
+    if (!multicursor_active())
+        return FALSE;
+
+    if ((mods & GDK_SHIFT_MASK) && !(mods & (GDK_CONTROL_MASK | GDK_MOD1_MASK))) {
+        if (event->keyval == GDK_KEY_Left || event->keyval == GDK_KEY_KP_Left) {
+            extend_multicursor_selection(-1);
+            return TRUE;
+        }
+        if (event->keyval == GDK_KEY_Right || event->keyval == GDK_KEY_KP_Right) {
+            extend_multicursor_selection(1);
+            return TRUE;
+        }
+    }
+
+    if (event->keyval == GDK_KEY_BackSpace) {
+        multicursor_delete_selections_or(TRUE);
+        return TRUE;
+    }
+
+    if (event->keyval == GDK_KEY_Delete) {
+        multicursor_delete_selections_or(FALSE);
+        return TRUE;
+    }
+
+    if (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter) {
+        multicursor_insert("\n");
+        return TRUE;
+    }
+
+    if (event->keyval == GDK_KEY_Tab) {
+        multicursor_insert("\t");
+        return TRUE;
+    }
+
+    ch = gdk_keyval_to_unicode(event->keyval);
+    if (ch && !g_unichar_iscntrl(ch) && !(mods & (GDK_CONTROL_MASK | GDK_MOD1_MASK))) {
+        gchar utf8[6];
+        gint len = g_unichar_to_utf8(ch, utf8);
+        utf8[len] = '\0';
+        multicursor_insert(utf8);
+        return TRUE;
+    }
+
+    /* Navigation and other keys drop multi-cursor and use default behavior */
+    clear_multicursor();
+    return FALSE;
+}
+
 void on_menu_about_activate(GtkMenuItem *menuitem, gpointer user_data) {
     const gchar *authors[] = {"Simple Text Editor contributors", NULL};
 
@@ -585,6 +1171,10 @@ static void connect_menus(GtkBuilder *builder, GtkAccelGroup *accel) {
     g_signal_connect(item, "activate", G_CALLBACK(on_menu_select_all_activate), NULL);
     add_accel(item, accel, GDK_KEY_a, GDK_CONTROL_MASK);
 
+    item = GTK_WIDGET(gtk_builder_get_object(builder, "menu_duplicate_line"));
+    g_signal_connect(item, "activate", G_CALLBACK(on_menu_duplicate_line_activate), NULL);
+    add_accel(item, accel, GDK_KEY_d, GDK_CONTROL_MASK);
+
     item = GTK_WIDGET(gtk_builder_get_object(builder, "menu_about"));
     g_signal_connect(item, "activate", G_CALLBACK(on_menu_about_activate), NULL);
 }
@@ -632,7 +1222,12 @@ int main(int argc, char *argv[])
     g_signal_connect(app.buffer, "changed", G_CALLBACK(on_changed), NULL);
     g_signal_connect(app.buffer, "mark-set", G_CALLBACK(on_mark_set), NULL);
     g_signal_connect(app.window, "delete-event", G_CALLBACK(on_window_delete), NULL);
+    g_signal_connect(app.text_view, "key-press-event", G_CALLBACK(on_key_press), NULL);
+    g_signal_connect(app.text_view, "button-press-event", G_CALLBACK(on_button_press), NULL);
+    g_signal_connect_after(app.text_view, "draw", G_CALLBACK(on_draw_cursors), NULL);
 
+    app.preferred_column = -1;
+    app.preferred_bound_column = -1;
     set_modified(FALSE);
     update_status("Готово");
 
@@ -645,6 +1240,8 @@ int main(int argc, char *argv[])
 
     clear_undo_stack(&app.undo_stack);
     clear_undo_stack(&app.redo_stack);
+    if (app.cursors)
+        g_array_free(app.cursors, TRUE);
     g_free(app.current_file);
     if (app.icon)
         g_object_unref(app.icon);
