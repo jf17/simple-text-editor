@@ -6,10 +6,15 @@ LDFLAGS += $(shell pkg-config --libs $(PKG) 2>/dev/null)
 TARGET  := simple-text-editor
 SRC     := main.c
 GLADE   := editor.glade
+ICON    := icon.png
+DESKTOP := simple-text-editor.desktop
 
-PREFIX  ?= /usr
-BINDIR  := $(PREFIX)/bin
-DATADIR := $(PREFIX)/share/$(TARGET)
+PREFIX      ?= /usr
+BINDIR      := $(PREFIX)/bin
+DATADIR     := $(PREFIX)/share/$(TARGET)
+PIXMAPDIR   := $(PREFIX)/share/pixmaps
+APPDIR      := $(PREFIX)/share/applications
+ICONDIR     := $(PREFIX)/share/icons/hicolor/512x512/apps
 
 # deb package
 PKG_NAME    := simple-text-editor
@@ -71,8 +76,14 @@ run: deps $(TARGET)
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -d $(DESTDIR)$(DATADIR)
+	install -d $(DESTDIR)$(PIXMAPDIR)
+	install -d $(DESTDIR)$(APPDIR)
+	install -d $(DESTDIR)$(ICONDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 	install -m 644 $(GLADE) $(DESTDIR)$(DATADIR)/$(GLADE)
+	install -m 644 $(ICON) $(DESTDIR)$(PIXMAPDIR)/$(TARGET).png
+	install -m 644 $(ICON) $(DESTDIR)$(ICONDIR)/$(TARGET).png
+	install -m 644 $(DESKTOP) $(DESTDIR)$(APPDIR)/$(DESKTOP)
 
 deb: deps $(TARGET)
 	@command -v dpkg-deb >/dev/null 2>&1 || { \

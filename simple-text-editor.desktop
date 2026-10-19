@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Simple Text Editor
+Comment=Простой текстовый редактор
+Exec=simple-text-editor %f
+Icon=simple-text-editor
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/plain;
+StartupNotify=true
