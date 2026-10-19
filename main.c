@@ -1,7 +1,18 @@
 #include <gtk/gtk.h>
 
+#ifndef GLADE_PATH
+#define GLADE_PATH "/usr/share/simple-text-editor/editor.glade"
+#endif
 
 GtkWidget *text_view; // Текстовый виджет
+
+static const char *find_glade_file(void) {
+    if (g_file_test("editor.glade", G_FILE_TEST_EXISTS))
+        return "editor.glade";
+    if (g_file_test(GLADE_PATH, G_FILE_TEST_EXISTS))
+        return GLADE_PATH;
+    return NULL;
+}
 
 // Функция для открытия файла
 void on_menu_open_activate(GtkMenuItem *menuitem, gpointer user_data) {
@@ -87,8 +98,14 @@ int main(int argc, char *argv[])
     gtk_init(&argc, &argv);
 
     // Загрузка интерфейса из файла Glade
+    const char *glade_file = find_glade_file();
+    if (!glade_file) {
+        g_printerr("Ошибка: файл интерфейса editor.glade не найден\n");
+        return 1;
+    }
+
     builder = gtk_builder_new();
-    if (!gtk_builder_add_from_file(builder, "editor.glade", &error)) {
+    if (!gtk_builder_add_from_file(builder, glade_file, &error)) {
         g_printerr("Ошибка при загрузке файла интерфейса: %s\n", error->message);
         g_clear_error(&error);
         return 1;
