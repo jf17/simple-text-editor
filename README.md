@@ -1,6 +1,8 @@
 # Simple Text Editor
 GTK3 and Glade
 
+**License:** [Apache License 2.0](LICENSE)
+
 ## Возможности
 
 - Новый / Открыть / Сохранить / Сохранить как

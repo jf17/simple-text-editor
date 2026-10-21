@@ -1,6 +1,8 @@
 #include <gtk/gtk.h>
 #include <string.h>
 
+#include "version.h"
+
 #ifndef GLADE_PATH
 #define GLADE_PATH "/usr/share/simple-text-editor/editor.glade"
 #endif
@@ -1180,7 +1182,7 @@ void on_menu_about_activate(GtkMenuItem *menuitem, gpointer user_data) {
                           "comments", "Простой текстовый редактор на GTK3 и Glade",
                           "authors", authors,
                           "logo", app.icon,
-                          "license-type", GTK_LICENSE_MIT_X11,
+                          "license-type", GTK_LICENSE_APACHE_2_0,
                           "website", "https://github.com/jf17/simple-text-editor",
                           NULL);
 }
