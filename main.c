@@ -315,6 +315,184 @@ static void load_file(const gchar *filename) {
     update_status("Файл открыт");
 }
 
+static gboolean path_looks_like_text_file(const gchar *path) {
+    gchar *content_type;
+    gboolean is_text = FALSE;
+
+    if (!path || !g_file_test(path, G_FILE_TEST_IS_REGULAR))
+        return FALSE;
+
+    content_type = g_content_type_guess(path, NULL, 0, NULL);
+    if (content_type) {
+        is_text = g_content_type_is_a(content_type, "text/*") ||
+                  g_content_type_equals(content_type, "application/json") ||
+                  g_content_type_equals(content_type, "application/xml") ||
+                  g_content_type_equals(content_type, "application/javascript") ||
+                  g_content_type_equals(content_type, "application/x-shellscript") ||
+                  g_content_type_equals(content_type, "application/x-desktop") ||
+                  g_content_type_is_a(content_type, "application/x-zerosize");
+        /* Empty files and unknown plaintext-ish types */
+        if (!is_text && g_content_type_is_unknown(content_type))
+            is_text = TRUE;
+        g_free(content_type);
+    }
+
+    return is_text;
+}
+
+static void open_dropped_path(const gchar *path) {
+    if (!path_looks_like_text_file(path)) {
+        GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(app.window),
+                                                   GTK_DIALOG_MODAL,
+                                                   GTK_MESSAGE_WARNING,
+                                                   GTK_BUTTONS_OK,
+                                                   "Можно открыть только текстовый файл:\n%s",
+                                                   path);
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+
+    if (!confirm_discard_changes())
+        return;
+
+    load_file(path);
+    update_status("Файл открыт (drag and drop)");
+}
+
+static gboolean open_first_local_uri(gchar **uris) {
+    guint i;
+
+    if (!uris)
+        return FALSE;
+
+    for (i = 0; uris[i] != NULL; i++) {
+        gchar *path = g_filename_from_uri(uris[i], NULL, NULL);
+        if (!path)
+            continue;
+        if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
+            open_dropped_path(path);
+            g_free(path);
+            return TRUE;
+        }
+        g_free(path);
+    }
+    return FALSE;
+}
+
+static gboolean drag_context_has_target(GdkDragContext *context, GdkAtom atom) {
+    GList *targets = gdk_drag_context_list_targets(context);
+    GList *l;
+
+    for (l = targets; l != NULL; l = l->next) {
+        if ((GdkAtom)l->data == atom)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean on_drag_motion(GtkWidget *widget, GdkDragContext *context,
+                               gint x, gint y, guint time, gpointer user_data) {
+    (void)widget;
+    (void)x;
+    (void)y;
+    (void)user_data;
+
+    gdk_drag_status(context, GDK_ACTION_COPY, time);
+    return TRUE;
+}
+
+static gboolean on_drag_drop(GtkWidget *widget, GdkDragContext *context,
+                             gint x, gint y, guint time, gpointer user_data) {
+    GdkAtom uri_atom = gdk_atom_intern_static_string("text/uri-list");
+    GdkAtom target;
+
+    (void)x;
+    (void)y;
+    (void)user_data;
+
+    /* Always prefer file URIs over plain-text path insertion */
+    if (drag_context_has_target(context, uri_atom))
+        target = uri_atom;
+    else
+        target = gtk_drag_dest_find_target(widget, context, NULL);
+
+    if (target == GDK_NONE)
+        return FALSE;
+
+    gtk_drag_get_data(widget, context, target, time);
+    return TRUE;
+}
+
+static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context,
+                                  gint x, gint y, GtkSelectionData *data,
+                                  guint info, guint time, gpointer user_data) {
+    gchar **uris;
+    gboolean success = FALSE;
+
+    (void)widget;
+    (void)x;
+    (void)y;
+    (void)info;
+    (void)user_data;
+
+    uris = gtk_selection_data_get_uris(data);
+    if (uris) {
+        success = open_first_local_uri(uris);
+        g_strfreev(uris);
+        gtk_drag_finish(context, success, FALSE, time);
+        return;
+    }
+
+    /* Fallback: file managers may send the path as text/plain */
+    {
+        const guchar *raw = gtk_selection_data_get_data(data);
+        gint len = gtk_selection_data_get_length(data);
+
+        if (raw && len > 0) {
+            gchar *text = g_strndup((const gchar *)raw, (gsize)len);
+            gchar *stripped = g_strstrip(text);
+            gchar *path = NULL;
+
+            if (g_str_has_prefix(stripped, "file://"))
+                path = g_filename_from_uri(stripped, NULL, NULL);
+            else if (stripped[0] == '/' && g_file_test(stripped, G_FILE_TEST_IS_REGULAR))
+                path = g_strdup(stripped);
+
+            if (path) {
+                open_dropped_path(path);
+                success = TRUE;
+                g_free(path);
+            } else if (GTK_IS_TEXT_VIEW(widget) && stripped[0] != '\0') {
+                /* Ordinary text drop: insert at cursor */
+                gtk_text_buffer_insert_at_cursor(app.buffer, stripped, -1);
+                success = TRUE;
+            }
+
+            g_free(text);
+        }
+    }
+
+    gtk_drag_finish(context, success, FALSE, time);
+}
+
+static void setup_drag_and_drop(GtkWidget *widget) {
+    GtkTargetList *targets = gtk_target_list_new(NULL, 0);
+
+    /* URI first — otherwise GtkTextView inserts the file path as text */
+    gtk_target_list_add_uri_targets(targets, 0);
+    gtk_target_list_add_text_targets(targets, 1);
+
+    gtk_drag_dest_unset(widget);
+    gtk_drag_dest_set(widget, GTK_DEST_DEFAULT_HIGHLIGHT, NULL, 0, GDK_ACTION_COPY);
+    gtk_drag_dest_set_target_list(widget, targets);
+    gtk_target_list_unref(targets);
+
+    g_signal_connect(widget, "drag-motion", G_CALLBACK(on_drag_motion), NULL);
+    g_signal_connect(widget, "drag-drop", G_CALLBACK(on_drag_drop), NULL);
+    g_signal_connect(widget, "drag-data-received", G_CALLBACK(on_drag_data_received), NULL);
+}
+
 static void new_document(void) {
     if (!confirm_discard_changes())
         return;
@@ -1309,6 +1487,8 @@ int main(int argc, char *argv[])
     g_signal_connect(app.text_view, "key-press-event", G_CALLBACK(on_key_press), NULL);
     g_signal_connect(app.text_view, "button-press-event", G_CALLBACK(on_button_press), NULL);
     g_signal_connect_after(app.text_view, "draw", G_CALLBACK(on_draw_cursors), NULL);
+    setup_drag_and_drop(app.window);
+    setup_drag_and_drop(app.text_view);
 
     app.preferred_column = -1;
     app.preferred_bound_column = -1;
